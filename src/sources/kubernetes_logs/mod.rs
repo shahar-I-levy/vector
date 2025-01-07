@@ -258,6 +258,13 @@ pub struct Config {
     #[configurable(metadata(docs::type_unit = "seconds"))]
     #[serde(default = "default_rotate_wait", rename = "rotate_wait_secs")]
     rotate_wait: Duration,
+
+    /// Enables adding the file offset to each event and sets the name of the log field used.
+    ///
+    /// The value is the byte offset of the start of the line within the file.
+    #[serde(default)]
+    #[configurable(metadata(docs::examples = "offset"))]
+    pub offset_key: Option<OptionalTargetPath>,
 }
 
 const fn default_read_from() -> ReadFromConfig {
@@ -304,6 +311,7 @@ impl Default for Config {
             log_namespace: None,
             internal_metrics: Default::default(),
             rotate_wait: default_rotate_wait(),
+            offset_key: None,
         }
     }
 }
@@ -328,8 +336,21 @@ impl SourceConfig for Config {
 
     fn outputs(&self, global_log_namespace: LogNamespace) -> Vec<SourceOutput> {
         let log_namespace = global_log_namespace.merge(self.log_namespace);
+
+        let offset_key = self
+            .offset_key
+            .as_ref()
+            .map(|_| LegacyKey::Overwrite(owned_value_path!("offset")));
+
         let schema_definition = BytesDeserializerConfig
             .schema_definition(log_namespace)
+            .with_source_metadata(
+                Self::NAME,
+                offset_key,
+                &owned_value_path!("offset"),
+                Kind::integer(),
+                None,
+            )
             .with_source_metadata(
                 Self::NAME,
                 Some(LegacyKey::Overwrite(owned_value_path!("file"))),
@@ -560,6 +581,7 @@ struct Source {
     delay_deletion: Duration,
     include_file_metric_tag: bool,
     rotate_wait: Duration,
+    offset_key: Option<OwnedTargetPath>,
 }
 
 impl Source {
@@ -622,6 +644,8 @@ impl Source {
             .clone()
             .and_then(|k| k.path);
 
+        let offset_key = config.offset_key.as_ref().and_then(|k| k.path.clone());
+
         Ok(Self {
             client,
             data_dir,
@@ -648,6 +672,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag: config.internal_metrics.include_file_tag,
             rotate_wait: config.rotate_wait,
+            offset_key,
         })
     }
 
@@ -683,6 +708,7 @@ impl Source {
             delay_deletion,
             include_file_metric_tag,
             rotate_wait,
+            offset_key,
         } = self;
 
         let mut reflectors = Vec::new();
@@ -739,8 +765,6 @@ impl Source {
             delay_deletion,
         )));
 
-        // -----------------------------------------------------------------
-
         let nodes = Api::<Node>::all(client);
         let node_watcher = watcher(
             nodes,
@@ -774,12 +798,8 @@ impl Source {
         let node_annotator = NodeMetadataAnnotator::new(node_state, node_field_spec, log_namespace);
 
         let ignore_before = calculate_ignore_before(ignore_older_secs);
-
-        // TODO: maybe more of the parameters have to be configurable.
-
         let checkpointer = Checkpointer::new(&data_dir);
         let file_server = FileServer {
-            // Use our special paths provider.
             paths_provider,
             // Max amount of bytes to read from a single file before switching
             // over to the next file.
@@ -837,14 +857,17 @@ impl Source {
         let checkpoints = checkpointer.view();
         let events = file_source_rx.flat_map(futures::stream::iter);
         let bytes_received = register!(BytesReceived::from(Protocol::HTTP));
+
         let events = events.map(move |line| {
             let byte_size = line.text.len();
             bytes_received.emit(ByteSize(byte_size));
 
             let mut event = create_event(
                 line.text,
+                line.start_offset,
                 &line.filename,
                 ingestion_timestamp_field.as_ref(),
+                offset_key.as_ref(),
                 log_namespace,
             );
 
@@ -924,9 +947,7 @@ impl Source {
             .map(|result| {
                 match result {
                     Ok(Ok(())) => info!(message = "Event processing loop completed gracefully."),
-                    Ok(Err(_)) => emit!(StreamClosedError {
-                        count: events_count
-                    }),
+                    Ok(Err(_)) => emit!(StreamClosedError { count: events_count }),
                     Err(error) => emit!(KubernetesLifecycleError {
                         error,
                         message: "Event processing loop timed out during the shutdown.",
@@ -949,8 +970,10 @@ impl Source {
 
 fn create_event(
     line: Bytes,
+    offset: u64,
     file: &str,
     ingestion_timestamp_field: Option<&OwnedTargetPath>,
+    offset_key: Option<&OwnedTargetPath>,
     log_namespace: LogNamespace,
 ) -> Event {
     let deserializer = BytesDeserializer;
@@ -963,6 +986,10 @@ fn create_event(
         path!("file"),
         file,
     );
+
+    if let Some(offset_key) = offset_key {
+        log.try_insert(offset_key, offset);
+    }
 
     log_namespace.insert_vector_metadata(
         &mut log,
@@ -1013,16 +1040,7 @@ const fn default_oldest_first() -> bool {
 }
 
 const fn default_max_line_bytes() -> usize {
-    // NOTE: The below comment documents an incorrect assumption, see
-    // https://github.com/vectordotdev/vector/issues/6967
-    //
-    // The 16KB is the maximum size of the payload at single line for both
-    // docker and CRI log formats.
-    // We take a double of that to account for metadata and padding, and to
-    // have a power of two rounding. Line splitting is countered at the
-    // parsers, see the `partial_events_merger` logic.
-
-    32 * 1024 // 32 KiB
+    32 * 1024
 }
 
 const fn default_glob_minimum_cooldown_ms() -> Duration {
@@ -1175,8 +1193,6 @@ mod tests {
     #[test]
     fn prepare_field_selector() {
         let cases = vec![
-            // We're not testing `Config::default()` or empty `self_node_name`
-            // as passing env vars in the concurrent tests is difficult.
             (
                 Config {
                     self_node_name: "qwe".to_owned(),
@@ -1211,10 +1227,7 @@ mod tests {
     #[test]
     fn prepare_label_selector() {
         let cases = vec![
-            (
-                Config::default().extra_label_selector,
-                "vector.dev/exclude!=true",
-            ),
+            (Config::default().extra_label_selector, "vector.dev/exclude!=true"),
             (
                 Config::default().extra_namespace_label_selector,
                 "vector.dev/exclude!=true",
@@ -1272,6 +1285,11 @@ mod tests {
             Some(
                 Definition::new_with_default_metadata(Kind::bytes(), [LogNamespace::Vector])
                     .with_metadata_field(
+                        &owned_value_path!("kubernetes_logs", "offset"),
+                        Kind::integer(),
+                        None
+                    )
+                    .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "file"),
                         Kind::bytes(),
                         None
@@ -1316,7 +1334,8 @@ mod tests {
                     )
                     .with_metadata_field(
                         &owned_value_path!("kubernetes_logs", "pod_ips"),
-                        Kind::array(Collection::empty().with_unknown(Kind::bytes())).or_undefined(),
+                        Kind::array(Collection::empty().with_unknown(Kind::bytes()))
+                            .or_undefined(),
                         None
                     )
                     .with_metadata_field(
@@ -1390,6 +1409,7 @@ mod tests {
                     Kind::object(Collection::empty()),
                     [LogNamespace::Legacy]
                 )
+                .with_event_field(&owned_value_path!("offset"), Kind::integer(), None)
                 .with_event_field(&owned_value_path!("file"), Kind::bytes(), None)
                 .with_event_field(
                     &owned_value_path!("message"),
@@ -1472,11 +1492,7 @@ mod tests {
                     Kind::timestamp(),
                     Some("timestamp")
                 )
-                .with_event_field(
-                    &owned_value_path!("source_type"),
-                    Kind::bytes(),
-                    None
-                )
+                .with_event_field(&owned_value_path!("source_type"), Kind::bytes(), None)
             )
         )
     }
